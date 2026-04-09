@@ -28,7 +28,7 @@ function printStatement(year, month, data) {
     <tr>
       <td style="padding:10px 12px;border-bottom:1px solid #e8e4dc;">${r.name}</td>
       <td style="padding:10px 12px;border-bottom:1px solid #e8e4dc;text-align:right;">${r.reading != null ? Number(r.reading).toFixed(1) : "—"}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid #e8e4dc;text-align:right;">${r.tDelta != null ? Number(r.tDelta).toFixed(1) : "—"}</td>
+      <td style="padding:10px 12px;border-bottom:1px solid #e8e4dc;text-align:right;">${r.netDelta != null ? Number(r.netDelta).toFixed(1) : "—"}</td>
       <td style="padding:10px 12px;border-bottom:1px solid #e8e4dc;text-align:right;">${r.share != null ? (r.share*100).toFixed(1)+"%" : "—"}</td>
       <td style="padding:10px 12px;border-bottom:1px solid #e8e4dc;text-align:right;font-weight:600;color:${r.amount != null ? "#1a5c28" : "#999"};">${r.amount != null ? "R "+Number(r.amount).toFixed(2) : "—"}</td>
     </tr>`).join("");
@@ -82,6 +82,7 @@ function printStatement(year, month, data) {
 const SETUP_SQL = `create table tenants (
   id uuid primary key default gen_random_uuid(),
   name text not null,
+  parent_tenant_id uuid references tenants(id) on delete set null,
   created_at timestamptz default now()
 );
 
@@ -241,15 +242,41 @@ export default function App() {
     const mainDelta = mainThis && mainPrev ? mainThis.reading - mainPrev.reading : null;
     const bill = bills.find(b => b.year === year && b.month === month);
 
-    const tenantRows = tenants.map(t => {
+    // First pass: compute raw deltas for every tenant
+    const rawDeltas = {};
+    tenants.forEach(t => {
       const tThis = tenantReadings.find(r => r.tenant_id === t.id && r.year === year && r.month === month);
       const tPrev = tenantReadings
         .filter(r => r.tenant_id === t.id && (r.year < year || (r.year === year && r.month < month)))
         .sort((a, b) => b.year - a.year || b.month - a.month)[0];
-      const tDelta = tThis && tPrev ? tThis.reading - tPrev.reading : null;
-      const share = mainDelta && tDelta != null ? tDelta / mainDelta : null;
+      rawDeltas[t.id] = tThis && tPrev ? tThis.reading - tPrev.reading : null;
+    });
+
+    // Second pass: subtract sub-tenant deltas from parent tenant net usage
+    const tenantRows = tenants.map(t => {
+      const tThis = tenantReadings.find(r => r.tenant_id === t.id && r.year === year && r.month === month);
+      const grossDelta = rawDeltas[t.id];
+
+      // Sum deltas of any tenants that have this tenant as parent
+      const subDeltaTotal = tenants
+        .filter(s => s.parent_tenant_id === t.id)
+        .reduce((sum, s) => {
+          const sd = rawDeltas[s.id];
+          return sd != null ? sum + sd : sum;
+        }, 0);
+
+      const hasSubTenants = tenants.some(s => s.parent_tenant_id === t.id);
+      const netDelta = grossDelta != null
+        ? (hasSubTenants ? grossDelta - subDeltaTotal : grossDelta)
+        : null;
+
+      const share = mainDelta && netDelta != null ? netDelta / mainDelta : null;
       const amount = share != null && bill ? share * bill.total_amount : null;
-      return { ...t, reading: tThis?.reading ?? null, tDelta, share, amount };
+      const parentName = t.parent_tenant_id
+        ? tenants.find(p => p.id === t.parent_tenant_id)?.name ?? null
+        : null;
+
+      return { ...t, reading: tThis?.reading ?? null, grossDelta, netDelta, share, amount, parentName };
     });
 
     return { mainReading: mainThis?.reading ?? null, mainDelta, billAmt: bill?.total_amount ?? null, tenantRows };
@@ -387,9 +414,13 @@ function Dashboard({ allMonths, computeMonth, tenants, fmtR, fmtN }) {
               <tbody>
                 {d?.tenantRows.map(row=>(
                   <tr key={row.id}>
-                    <td style={{color:"var(--ink)",fontWeight:500}}>{row.name}</td>
+                    <td style={{color:"var(--ink)",fontWeight:500}}>
+                      {row.parentName
+                        ? <><span style={{color:"var(--ink3)",marginRight:6}}>↳</span>{row.name}<span style={{fontSize:10,color:"var(--ink3)",fontWeight:400,marginLeft:6}}>sub of {row.parentName}</span></>
+                        : row.name}
+                    </td>
                     <td style={{fontVariantNumeric:"tabular-nums"}}>{row.reading!=null?fmtN(row.reading,1):<span style={{color:"var(--ink3)"}}>—</span>}</td>
-                    <td style={{fontVariantNumeric:"tabular-nums"}}>{row.tDelta!=null?fmtN(row.tDelta,1):<span style={{color:"var(--ink3)"}}>—</span>}</td>
+                    <td style={{fontVariantNumeric:"tabular-nums"}}>{row.netDelta!=null?fmtN(row.netDelta,1):<span style={{color:"var(--ink3)"}}>—</span>}</td>
                     <td style={{color:"var(--ink3)"}}>{row.share!=null?`${(row.share*100).toFixed(1)}%`:"—"}</td>
                     <td style={{color:row.amount!=null?"var(--green)":"var(--ink3)",fontWeight:row.amount!=null?500:400}}>
                       {row.amount!=null?fmtR(row.amount):"—"}
@@ -595,7 +626,7 @@ function History({ allMonths, computeMonth, fmtR, fmtN }) {
                   {d.tenantRows.map(row=>(
                     <tr key={row.id}>
                       <td>{row.name}</td>
-                      <td>{row.tDelta!=null?fmtN(row.tDelta,1):<span style={{color:"var(--ink3)"}}>—</span>}</td>
+                      <td>{row.netDelta!=null?fmtN(row.netDelta,1):<span style={{color:"var(--ink3)"}}>—</span>}</td>
                       <td style={{color:"var(--ink3)"}}>{row.share!=null?`${(row.share*100).toFixed(1)}%`:"—"}</td>
                       <td style={{color:row.amount!=null?"var(--green)":"var(--ink3)",fontWeight:row.amount!=null?500:400}}>
                         {row.amount!=null?fmtR(row.amount):"—"}
@@ -615,44 +646,122 @@ function History({ allMonths, computeMonth, fmtR, fmtN }) {
 // ─── TENANTS ──────────────────────────────────────────────────────────────────
 function Tenants({ sb, tenants, loadAll, showToast }) {
   const [name, setName] = useState("");
+  const [parentId, setParentId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [editingParent, setEditingParent] = useState(null); // tenant id being edited
 
   const add = async () => {
     const n = name.trim();
     if (!n) return;
     setSaving(true);
-    const {error} = await sb.from("tenants").insert({name:n});
+    const payload = { name: n, parent_tenant_id: parentId || null };
+    const {error} = await sb.from("tenants").insert(payload);
     if (error) showToast(error.message,"err");
-    else { showToast(`${n} added ✓`); setName(""); await loadAll(); }
+    else { showToast(`${n} added ✓`); setName(""); setParentId(""); await loadAll(); }
     setSaving(false);
   };
 
   const remove = async (id, tname) => {
+    // Prevent removing a parent that has sub-tenants
+    if (tenants.some(t => t.parent_tenant_id === id)) {
+      showToast("Remove sub-tenants first","err"); return;
+    }
     if (!confirm(`Remove ${tname}? This will also delete all their readings.`)) return;
     const {error} = await sb.from("tenants").delete().eq("id",id);
     if (error) showToast(error.message,"err");
     else { showToast(`${tname} removed`); await loadAll(); }
   };
 
+  const saveParent = async (id, newParentId) => {
+    const {error} = await sb.from("tenants").update({ parent_tenant_id: newParentId || null }).eq("id", id);
+    if (error) showToast(error.message,"err");
+    else { showToast("Sub-meter updated ✓"); setEditingParent(null); await loadAll(); }
+  };
+
+  // Sort: parents first, then sub-tenants grouped under their parent
+  const sorted = [
+    ...tenants.filter(t => !t.parent_tenant_id),
+    ...tenants.filter(t => t.parent_tenant_id),
+  ];
+
   return (
-    <div style={{maxWidth:460}}>
+    <div style={{maxWidth:520}}>
       <div style={{fontFamily:"var(--serif)",fontSize:28,fontStyle:"italic",color:"var(--ink)",marginBottom:22}}>Tenants</div>
-      <div style={{display:"flex",gap:10,marginBottom:22}}>
-        <input className="inp" value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&add()} placeholder="Tenant name" />
-        <button className="btn" onClick={add} disabled={saving||!name.trim()} style={{whiteSpace:"nowrap"}}>+ Add</button>
+
+      {/* Add tenant form */}
+      <div className="card" style={{padding:20,marginBottom:22}}>
+        <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--ink2)",marginBottom:14,fontWeight:500,letterSpacing:".05em"}}>Add tenant</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+          <div>
+            <div className="lbl">Name</div>
+            <input className="inp" value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&add()} placeholder="Tenant name" />
+          </div>
+          <div>
+            <div className="lbl">Sub-meter of (optional)</div>
+            <select className="sel" value={parentId} onChange={e=>setParentId(e.target.value)}>
+              <option value="">— None (independent) —</option>
+              {tenants.filter(t=>!t.parent_tenant_id).map(t=>(
+                <option key={t.id} value={t.id}>{t.name}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <button className="btn" onClick={add} disabled={saving||!name.trim()}>+ Add</button>
       </div>
+
+      {/* Tenant list */}
       {tenants.length===0
         ? <div style={{color:"var(--ink3)",fontSize:13,textAlign:"center",padding:"40px 0"}}>No tenants yet.</div>
         : <div className="card">
-            {tenants.map((t,i)=>(
-              <div key={t.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"13px 16px",borderBottom:i<tenants.length-1?"1px solid var(--bg3)":"none"}}>
-                <div>
-                  <div style={{fontSize:14,color:"var(--ink)"}}>{t.name}</div>
-                  <div style={{fontSize:10,color:"var(--ink3)",marginTop:2}}>Added {new Date(t.created_at).toLocaleDateString("en-ZA",{year:"numeric",month:"short",day:"numeric"})}</div>
+            {sorted.map((t,i)=>{
+              const isSubTenant = !!t.parent_tenant_id;
+              const parentName = isSubTenant ? tenants.find(p=>p.id===t.parent_tenant_id)?.name : null;
+              const hasSubTenants = tenants.some(s=>s.parent_tenant_id===t.id);
+              return (
+                <div key={t.id} style={{
+                  padding:"13px 16px",
+                  borderBottom:i<sorted.length-1?"1px solid var(--bg3)":"none",
+                  background: isSubTenant ? "var(--bg)" : "white",
+                  paddingLeft: isSubTenant ? 32 : 16,
+                }}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                    <div>
+                      <div style={{fontSize:14,color:"var(--ink)",display:"flex",alignItems:"center",gap:6}}>
+                        {isSubTenant && <span style={{color:"var(--ink3)"}}>↳</span>}
+                        {t.name}
+                        {hasSubTenants && <span style={{fontSize:10,background:"var(--bg2)",color:"var(--ink3)",padding:"1px 6px",marginLeft:4}}>parent</span>}
+                        {isSubTenant && <span style={{fontSize:10,color:"var(--ink3)"}}>sub of {parentName}</span>}
+                      </div>
+                      <div style={{fontSize:10,color:"var(--ink3)",marginTop:2}}>
+                        Added {new Date(t.created_at).toLocaleDateString("en-ZA",{year:"numeric",month:"short",day:"numeric"})}
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                      <button className="btn-sm" style={{fontSize:9,padding:"4px 10px"}}
+                        onClick={()=>setEditingParent(editingParent===t.id?null:t.id)}>
+                        {editingParent===t.id?"Cancel":"Edit sub-meter"}
+                      </button>
+                      <button className="btn-del" onClick={()=>remove(t.id,t.name)}>Remove</button>
+                    </div>
+                  </div>
+                  {/* Inline parent editor */}
+                  {editingParent===t.id && (
+                    <div style={{marginTop:12,display:"flex",gap:10,alignItems:"center"}}>
+                      <div style={{flex:1}}>
+                        <div className="lbl">Sub-meter of</div>
+                        <select className="sel" defaultValue={t.parent_tenant_id||""}
+                          onChange={e=>saveParent(t.id, e.target.value)}>
+                          <option value="">— None (independent) —</option>
+                          {tenants.filter(p=>p.id!==t.id&&!p.parent_tenant_id).map(p=>(
+                            <option key={p.id} value={p.id}>{p.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <button className="btn-del" onClick={()=>remove(t.id,t.name)}>Remove</button>
-              </div>
-            ))}
+              );
+            })}
           </div>
       }
     </div>
