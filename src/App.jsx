@@ -678,11 +678,10 @@ function Tenants({ sb, tenants, loadAll, showToast }) {
     else { showToast("Sub-meter updated ✓"); setEditingParent(null); await loadAll(); }
   };
 
-  // Sort: parents first, then sub-tenants grouped under their parent
-  const sorted = [
-    ...tenants.filter(t => !t.parent_tenant_id),
-    ...tenants.filter(t => t.parent_tenant_id),
-  ];
+  // Sort: each parent immediately followed by its sub-tenants
+  const sorted = tenants
+    .filter(t => !t.parent_tenant_id)
+    .flatMap(t => [t, ...tenants.filter(s => s.parent_tenant_id === t.id)]);
 
   return (
     <div style={{maxWidth:520}}>
